@@ -19,6 +19,7 @@ for name, cur_ssid, portal_ok, auto_switch, expect_connect in CASES:
     ctl.visible_networks = lambda: ['SNNU', 'WIFI_5G']
     ctl.saved_profiles = lambda: ['SNNU', 'Redmi K60']
     ctl.wait_for_ssid = lambda ssid, timeout=15: True
+    ctl.wired_connected = lambda: False  # 打桩：真机以太网在线时不短路，保持用例语义
     calls = []
 
     def fake_connect(ssid, _c=calls):

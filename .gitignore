@@ -3,10 +3,6 @@ config.ini
 auto_login.log
 *.log
 
-# 浏览器驱动体积大且随版本变化，见 README 的下载说明
-msedgedriver.exe
-chromedriver.exe
-
 # Python
 __pycache__/
 *.pyc

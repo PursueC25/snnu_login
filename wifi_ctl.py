@@ -28,9 +28,13 @@ ENCODINGS = ('utf-8', 'gb18030', 'mbcs')
 # 状态关键字（中英文都认）
 CONNECTED_WORDS = ('已连接', 'connected')
 DISCONNECTED_WORDS = ('已断开', '未连接', 'disconnected')
+WIRED_WORDS = ('以太网', 'ethernet')
+# 虚拟/伪以太网类接口名关键字：这些接口「已连接」不代表真有线在线，误判会让 Wi-Fi 兜底静默失效
+VIRTUAL_WORDS = ('vethernet', 'virtual', 'vmware', 'hyper-v', 'wsl', 'loopback', 'bluetooth', 'tap')
 SUCCESS_WORDS = ('已成功完成', '成功完成', 'successfully', 'completed')
 
 RE_KV = re.compile(r'^\s*([^\s:][^:]*?)\s*:\s*(.*?)\s*$')
+RE_COLS = re.compile(r'\s{2,}')
 RE_NET_SSID = re.compile(r'^\s*SSID\s*\d+\s*:\s*(.+?)\s*$')
 
 
@@ -79,14 +83,20 @@ class WifiController:
         self._log = log
 
     # ------------------------------------------------------------ 底层
-    def _netsh(self, args: str, timeout: int = 20):
-        cmd = f'netsh wlan {args}'
+    def _run(self, cmd: str, timeout: int = 20):
         try:
             r = subprocess.run(cmd, capture_output=True, shell=True, timeout=timeout)
             return r.returncode, decode(r.stdout)
         except Exception as e:
             self._log(f'[WiFi] 执行 "{cmd}" 失败: {e.__class__.__name__} {e}')
             return -1, ''
+
+    def _netsh(self, args: str, timeout: int = 20):
+        return self._run(f'netsh wlan {args}', timeout)
+
+    def _netsh_sys(self, args: str, timeout: int = 20):
+        """执行只读的 `netsh <args>`（非 wlan 子命令）"""
+        return self._run(f'netsh {args}', timeout)
 
     # ------------------------------------------------------------ 查询
     def interfaces(self):
@@ -133,6 +143,34 @@ class WifiController:
 
     def is_connected(self):
         return self.current_ssid() is not None
+
+    def wired_connected(self):
+        """有线（以太网类接口）是否已连接；只读探测，不做任何改动
+
+        netsh interface show interface 的行形如：
+            已启用            已连接            专用               以太网
+        列序为 管理状态 / 状态 / 类型 / 接口名，中英文措辞与空白宽度都可能不同。
+        """
+        _, text = self._netsh_sys('interface show interface')
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or set(line) <= {'-'}:
+                continue
+            low = line.lower()
+            if not any(w in low for w in WIRED_WORDS):
+                continue
+            # 虚拟/伪以太网（vEthernet、VMware Virtual Ethernet、TAP、环回、蓝牙 PAN 等）一律不算有线
+            if any(w in low for w in VIRTUAL_WORDS):
+                continue
+            cols = [c.strip() for c in RE_COLS.split(line) if c.strip()]
+            # 取不到列时退回整行判断
+            state = cols[1].lower() if len(cols) >= 3 else low
+            # 先判断开：英文 "disconnected" 里含有 "connected"
+            if any(w in state for w in DISCONNECTED_WORDS):
+                continue
+            if any(w in state for w in CONNECTED_WORDS):
+                return True
+        return False
 
     def visible_networks(self):
         """当前能搜到的 Wi-Fi 名称列表"""
@@ -213,6 +251,11 @@ class WifiController:
             self._log('[WiFi] 门户已可达，无需干预 Wi-Fi')
             return True
 
+        # 有线保护：以太网在线时门户不可达多半只是认证/网关抖动，绝不能因此去连 Wi-Fi
+        if self.wired_connected():
+            self._log('[WiFi] 检测到有线连接，不干预 Wi-Fi，等待门户恢复')
+            return True
+
         cur = self.current_ssid()
         if self.is_campus_wifi(cur):
             self._log(f'[WiFi] 已连校园网 Wi-Fi "{cur}"，但门户不可达，等待网络就绪')
@@ -257,6 +300,7 @@ def main():
     cur = ctl.current_ssid()
     log_info(f'当前 Wi-Fi: {cur or "(未连接)"}')
     log_info(f'是否校园网 Wi-Fi: {ctl.is_campus_wifi(cur)}')
+    log_info(f'有线连接: {ctl.wired_connected()}')
     log_info(f'可见网络: {ctl.visible_networks()}')
     log_info(f'已保存配置: {ctl.saved_profiles()}')
     log_info(f'接口详情: {ctl.interfaces()}')

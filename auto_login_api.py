@@ -13,9 +13,9 @@
     python auto_login_api.py --status      # 只看状态，不登录
     python auto_login_api.py --logoff      # 主动断开
     python auto_login_api.py --test-cycle  # 端到端自检：断开 -> 重连（真实断网数秒）
-    python auto_login_api.py --no-fallback # 接口失败时不回退浏览器版
+    python auto_login_api.py --setup       # 重新填写账号密码
 
-接口失败时默认自动回退到 auto_login_selenium.py（可在 config.ini 关掉）。
+首次运行（没有 config.ini）时会自动进入配置向导，按提示输入学号和密码即可。
 """
 
 import argparse
@@ -110,10 +110,242 @@ def trim_log_file(max_lines: int = 5000):
 
 
 # ---------------------------------------------------------------- 配置
-def load_config() -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
+PROVIDER_CHOICES = [
+    ('1', 'mobile', '中国移动'),
+    ('2', 'unicom', '中国联通'),
+    ('3', 'telecom', '中国电信'),
+    ('4', '', '校园网（不代拨）'),
+]
+
+TEMPLATE = """[User]
+account = {account}
+password = {password}
+
+[Network]
+# 代拨运营商：mobile / unicom / telecom，留空表示校园网（不代拨）
+provider = {provider}
+base_url = http://202.117.144.205:8602/snnuportal
+
+[WiFi]
+# 是否在门户不可达时自动连接校园网 Wi-Fi（目前仅 Windows 生效）
+enabled = {wifi_enabled}
+ssid = SNNU
+interface =
+# 已连着其他 Wi-Fi（如手机热点）时，是否强制切回校园网
+auto_switch = false
+wait_after_connect = 20
+
+[Settings]
+timeout = 8
+retries = 3
+"""
+
+
+def _ask(prompt: str, default: str = '') -> str:
+    """读取一行输入；EOF / 非交互时抛出 EOFError 由上层处理"""
+    tip = f'{prompt}' + (f'（默认 {default}）' if default else '')
+    try:
+        print(tip, end='', flush=True)
+    except Exception:
+        pass
+    line = input().strip()
+    return line or default
+
+
+def _ask_password() -> str:
+    """优先用 getpass 隐藏输入，失败（无 tty / 异常）时退回明文输入"""
+    try:
+        import getpass
+        return getpass.getpass('请输入校园网密码（输入时不显示）: ').strip()
+    except Exception:
+        print('请输入校园网密码: ', end='', flush=True)
+        return input().strip()
+
+
+def _resolve_shortcut_target() -> str:
+    """解析自启快捷方式的目标路径（exe 或脚本）"""
+    if getattr(sys, 'frozen', False):
+        # 打包态：目标为 exe 自身，参数 --watch --no-pause
+        return f'"{sys.executable}"'
+    else:
+        # 源码态：目标为 python.exe + 本脚本路径
+        return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+
+def _resolve_shortcut_args() -> str:
+    """解析自启快捷方式的命令行参数"""
+    if getattr(sys, 'frozen', False):
+        return '--watch --no-pause'
+    else:
+        return '--watch'
+
+
+def _get_startup_dir() -> str:
+    """获取 Windows 用户启动文件夹路径；支持环境变量 SNNU_STARTUP_DIR 覆盖（自动化测试钩子）"""
+    if 'SNNU_STARTUP_DIR' in os.environ:
+        return os.environ['SNNU_STARTUP_DIR']
+    # shell:startup 通过 PowerShell 解析
+    try:
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', '[Environment]::GetFolderPath("Startup")'],
+            capture_output=True, text=True, timeout=10)
+        path = r.stdout.strip()
+        if path:
+            return path
+    except Exception:
+        pass
+    # 兜底：手动拼 APPDATA 路径
+    appdata = os.environ.get('APPDATA', '')
+    if appdata:
+        return os.path.join(appdata, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+    return ''
+
+
+def _register_startup() -> bool:
+    """
+    在 Windows 用户启动文件夹写入本工具的自启 .lnk 快捷方式。
+    幂等：重复注册覆盖同名 .lnk。返回是否成功。
+    """
+    startup_dir = _get_startup_dir()
+    if not startup_dir:
+        log_warn('无法获取 Windows 启动文件夹路径，跳过自启注册')
+        return False
+    lnk_path = os.path.join(startup_dir, '陕Star校园网自动登录.lnk')
+    target = _resolve_shortcut_target()
+    args = _resolve_shortcut_args()
+
+    # 使用 PowerShell WScript.Shell 创建 .lnk，WindowStyle=7 最小化
+    ps_script = f'''
+$ws = New-Object -ComObject WScript.Shell
+$sc = $ws.CreateShortcut("{lnk_path}")
+$sc.TargetPath = "{sys.executable if getattr(sys, 'frozen', False) else sys.executable}"
+'''
+    if not getattr(sys, 'frozen', False):
+        ps_script += f'$sc.Arguments = "{os.path.abspath(__file__)} --watch"\n'
+    else:
+        ps_script += '$sc.Arguments = "--watch --no-pause"\n'
+    ps_script += '''
+$sc.WindowStyle = 7
+$sc.Save()
+'''
+    try:
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', ps_script],
+            capture_output=True, text=True, timeout=30)
+        # 回读验证
+        if os.path.exists(lnk_path):
+            log_info(f'已注册开机自启: {lnk_path}')
+            return True
+        else:
+            log_warn(f'自启注册后 .lnk 未出现: {lnk_path}，stderr={r.stderr[:200]}')
+            return False
+    except Exception as e:
+        log_warn(f'自启注册失败: {e.__class__.__name__} {e}')
+        return False
+
+
+def _unregister_startup() -> bool:
+    """删除本工具的自启 .lnk；已不存在时视为成功。"""
+    startup_dir = _get_startup_dir()
+    if not startup_dir:
+        return True
+    lnk_path = os.path.join(startup_dir, '陕Star校园网自动登录.lnk')
+    if not os.path.exists(lnk_path):
+        return True
+    try:
+        os.remove(lnk_path)
+        log_info(f'已删除开机自启: {lnk_path}')
+        return True
+    except Exception as e:
+        log_warn(f'删除自启快捷方式失败: {e.__class__.__name__} {e}')
+        return False
+
+
+def interactive_setup() -> bool:
+    """
+    首次运行向导：config.ini 不存在时引导用户填写账号密码并生成配置文件。
+    返回是否成功生成。
+    """
+    print()
+    print('=' * 56)
+    print('  首次运行：需要先配置你的校园网账号')
+    print('=' * 56)
+    print('（这些信息只会保存在本机的 config.ini，不会上传到任何地方）')
+    print()
+
+    account = _ask('请输入校园网账号（学号）: ')
+    if not account:
+        print('[失败] 账号不能为空。')
+        return False
+
+    password = _ask_password()
+    if not password:
+        print('[失败] 密码不能为空。')
+        return False
+
+    print()
+    print('请选择上网方式（代拨运营商）：')
+    for key, _val, label in PROVIDER_CHOICES:
+        print(f'  {key}. {label}')
+    picked = _ask('输入序号', '1')
+    provider = next((v for k, v, _ in PROVIDER_CHOICES if k == picked),
+                    'mobile' if picked not in ('2', '3', '4') else '')
+    print(f'已选择: {provider or "校园网（不代拨）"}')
+
+    wifi_enabled = 'true' if os.name == 'nt' else 'false'
+
+    # 开机自启询问（仅 Windows）
+    if sys.platform == 'win32':
+        print()
+        ans = _ask('是否开机自启（常驻保活，掉线自动重连）? [y/N]', 'n').lower()
+        if ans == 'y':
+            _register_startup()
+            print('已注册开机自启。')
+        else:
+            _unregister_startup()
+            print('未注册开机自启。')
+    else:
+        print()
+        print('提示: 非 Windows 系统，可在 install.sh 中配置自启。')
+
+    content = TEMPLATE.format(account=account, password=password,
+                              provider=provider, wifi_enabled=wifi_enabled)
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            f.write(content)
+        if os.name != 'nt':
+            try:
+                os.chmod(CONFIG_FILE, 0o600)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f'[失败] 无法写入配置文件 {CONFIG_FILE}: {e}')
+        print('       若程序装在 C:\\Program Files 等受保护目录，请换到普通文件夹再运行。')
+        return False
+
+    print()
+    print(f'[成功] 已生成配置文件: {CONFIG_FILE}')
+    print('       以后想改账号密码，直接编辑这个文件即可。')
+    print('=' * 56)
+    print()
+    log_info(f'首次运行向导已生成配置文件（账号={account}, 运营商={provider or "校园网"}）')
+    return True
+
+
+def load_config(allow_setup: bool = True) -> configparser.ConfigParser:
+    # interpolation=None：密码里含 % 时不会被当成插值语法而报错
+    cfg = configparser.ConfigParser(interpolation=None)
     if not os.path.exists(CONFIG_FILE):
+        # 只在"有人在看着屏幕"时才引导填写；计划任务/管道里无法交互，直接报错更清楚
+        interactive = allow_setup and sys.stdin is not None and sys.stdin.isatty()
+        if interactive and interactive_setup():
+            cfg.read(CONFIG_FILE, encoding='utf-8')
+            return cfg
         log_error(f'未找到配置文件 {CONFIG_FILE}')
+        if not interactive:
+            log_error('当前为非交互环境（后台/计划任务），无法引导填写。')
+        log_error('请手动创建：把 config.example.ini 复制为 config.ini 并填入账号密码，'
+                  '或在命令行下直接运行本程序按提示填写。')
         raise SystemExit(2)
     cfg.read(CONFIG_FILE, encoding='utf-8')
     return cfg
@@ -130,6 +362,65 @@ def decode(resp) -> str:
     return raw.decode('gb18030', errors='replace')
 
 
+def wait_for_network(client, wifi, max_wait_minutes: int, check_interval: int) -> bool:
+    """
+    等待校园网可用：门户不可达时先尝试把 Wi-Fi 连上校园网，再检测门户。
+    连 Wi-Fi 只在没网的时候发生，正常上网时不干预。
+    """
+    start = time.time()
+    deadline = max_wait_minutes * 60
+    log_info(f'开始等待校园网连接，最长 {max_wait_minutes} 分钟，每 {check_interval} 秒检测一次')
+
+    while True:
+        if wifi:
+            wifi.ensure_campus_wifi(client.portal_reachable)
+        if client.portal_reachable():
+            return True
+        if time.time() - start > deadline:
+            log_error(f'等待超时（{max_wait_minutes} 分钟），未检测到校园网')
+            return False
+        log_info('校园网门户不可达，继续等待...')
+        time.sleep(check_interval)
+
+
+def run_watch(args) -> int:
+    """常驻保活模式：等待校园网 → 登录 → 周期性检查 → 掉线自动重连。
+    由 --watch (auto_login_api.py) 或 --daemon (auto_login_watch.py) 触发。"""
+    cfg = load_config()
+    client = PortalClient(cfg)
+    wifi = build_wifi_controller(cfg) if not args.no_wifi else None
+
+    # 等待校园网出现并完成首次登录
+    if not wait_for_network(client, wifi, args.wait, args.interval):
+        return 1
+
+    ok = client.ensure_online()
+
+    # 非 watch 模式（仅 --daemon 时由旧 watch 调用进来），仅完成单次登录
+    daemon = getattr(args, 'watch', False) or getattr(args, 'daemon', False)
+    if not daemon:
+        log_info('单次登录模式结束')
+        return 0 if ok else 1
+
+    # 常驻：周期性检查，掉线自动重连
+    log_info(f'进入常驻模式，每 {args.interval} 秒检查一次在线状态')
+    while True:
+        time.sleep(args.interval)
+        try:
+            online, acc, ts, _ = client.get_status()
+            if online:
+                continue
+            log_warn('检测到已掉线，先确认 Wi-Fi，再尝试重新登录')
+            if wifi:
+                wifi.ensure_campus_wifi(client.portal_reachable)
+            client.ensure_online()
+        except KeyboardInterrupt:
+            log_info('收到退出信号，监听结束')
+            return 0
+        except Exception as e:
+            log_warn(f'检查异常: {e.__class__.__name__} {e}')
+
+
 class PortalClient:
     def __init__(self, cfg: configparser.ConfigParser):
         self.account = cfg.get('User', 'account').strip()
@@ -139,7 +430,6 @@ class PortalClient:
                                 fallback='http://202.117.144.205:8602/snnuportal').rstrip('/')
         self.timeout = cfg.getint('Settings', 'timeout', fallback=8)
         self.retries = cfg.getint('Settings', 'retries', fallback=3)
-        self.fallback_selenium = cfg.getboolean('Settings', 'fallback_selenium', fallback=True)
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -278,40 +568,58 @@ class PortalClient:
         log_error('登录失败：重试已用尽')
         return False
 
-    def try_selenium_fallback(self) -> bool:
-        """接口登录失败时的兜底：改用浏览器版登录"""
-        script = os.path.join(SCRIPT_DIR, 'auto_login_selenium.py')
-        if not os.path.exists(script):
-            log_warn('未找到 auto_login_selenium.py，无法回退')
-            return False
-        log_info('接口登录失败，回退到浏览器版 (Selenium) ...')
-        try:
-            r = subprocess.run([sys.executable, script], cwd=SCRIPT_DIR,
-                               timeout=180, capture_output=True, text=True)
-            for line in (r.stdout or '').strip().splitlines()[-3:]:
-                log_info('[selenium] ' + line.strip())
-            ok = (r.returncode == 0)
-            log_info(f'浏览器版回退结果: {"成功" if ok else "失败"}')
-            return ok
-        except Exception as e:
-            log_error(f'回退浏览器版异常: {e.__class__.__name__} {e}')
-            return False
+
+def _pause_if_needed(args) -> None:
+    """
+    exe 双击运行时，控制台会在结束瞬间关闭，用户来不及看结果。
+    这里在冻结（PyInstaller 打包）且非后台模式下等待一次回车。
+    """
+    if not getattr(sys, 'frozen', False) or args.no_pause:
+        return
+    try:
+        print()
+        print('按回车键关闭窗口...', end='', flush=True)
+        input()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- 入口
 def main() -> int:
     ap = argparse.ArgumentParser(description='陕Star校园网登录（接口版）')
+    _add_arguments(ap)
+    args = ap.parse_args()
+    code = run(args)
+    _pause_if_needed(args)
+    return code
+
+
+def _add_arguments(ap: argparse.ArgumentParser):
     ap.add_argument('--status', action='store_true', help='只查询在线状态，不登录')
     ap.add_argument('--logoff', action='store_true', help='主动断开连接')
     ap.add_argument('--test-cycle', action='store_true',
                     help='端到端自检：断开后重新登录（会真实断网数秒）')
-    ap.add_argument('--no-fallback', action='store_true', help='登录失败时不回退浏览器版')
+    ap.add_argument('--no-fallback', action='store_true', help='（已废弃，保留兼容）')
     ap.add_argument('--no-wifi', action='store_true', help='本次不干预 Wi-Fi')
     ap.add_argument('--wifi-info', action='store_true', help='只读：显示 Wi-Fi 状态后退出')
-    args = ap.parse_args()
+    ap.add_argument('--setup', action='store_true', help='重新运行配置向导（重填账号密码）')
+    ap.add_argument('--no-pause', action='store_true', help='exe 双击运行时结束不暂停')
+    ap.add_argument('--watch', action='store_true', help='常驻保活模式：掉线自动重连')
+    ap.add_argument('--interval', type=int, default=15, help='保活检测间隔秒数，默认 15')
+    ap.add_argument('--wait', type=int, default=10, help='等待校园网出现的分钟数，默认 10')
+    return ap
 
+
+def run(args) -> int:
     trim_log_file()
     log_info('=' * 50)
+
+    if args.setup:
+        return 0 if interactive_setup() else 1
+
+    # --watch 常驻保活模式
+    if args.watch:
+        return run_watch(args)
 
     cfg = load_config()
     client = PortalClient(cfg)
@@ -321,7 +629,8 @@ def main() -> int:
         if not wifi:
             wifi = WifiController(['SNNU'])
         cur = wifi.current_ssid()
-        log_info(f'当前 Wi-Fi: {cur or "(未连接)"} | 校园网 Wi-Fi: {wifi.is_campus_wifi(cur)}')
+        log_info(f'当前 Wi-Fi: {cur or "(未连接)"} | 校园网 Wi-Fi: {wifi.is_campus_wifi(cur)}'
+                 f' | 有线连接: {wifi.wired_connected()}')
         log_info(f'可见网络: {wifi.visible_networks()}')
         log_info(f'已保存配置: {wifi.saved_profiles()}')
         return 0
@@ -359,15 +668,10 @@ def main() -> int:
             return 1
         log_info('已确认离线，开始重连')
         ok = client.ensure_online()
-        if not ok and client.fallback_selenium and not args.no_fallback:
-            log_warn('接口重连失败，立即回退浏览器版恢复网络')
-            ok = client.try_selenium_fallback()
         log_info(f'自检结果: {"通过" if ok else "失败"}')
         return 0 if ok else 1
 
     ok = client.ensure_online()
-    if not ok and client.fallback_selenium and not args.no_fallback:
-        ok = client.try_selenium_fallback()
     log_info('任务完成' if ok else '任务失败')
     return 0 if ok else 1
 
