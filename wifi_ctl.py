@@ -11,10 +11,15 @@ Windows Wi-Fi 控制封装（基于 netsh wlan，无需额外依赖）
 import os
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 打包成 exe 后 __file__ 指向临时解包目录，改用 exe 所在目录定位日志
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(SCRIPT_DIR, 'auto_login.log')
 
 # netsh 在中文 Windows 上输出 UTF-8；为兼容其他语言环境做多编码尝试

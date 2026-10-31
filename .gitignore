@@ -12,9 +12,15 @@ __pycache__/
 *.pyc
 .venv/
 
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
 # 本地杂项（截图调试产物、旧文档等）
 *.png
 *.pdf
+*.docx
 readme.txt
 
 # WorkBuddy 项目数据

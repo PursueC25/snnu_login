@@ -31,7 +31,11 @@ import requests
 
 from wifi_ctl import WifiController
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 打包成 exe 后 __file__ 指向临时解包目录，改用 exe 所在目录定位配置
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.ini')
 LOG_FILE = os.path.join(SCRIPT_DIR, 'auto_login.log')
 
