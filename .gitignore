@@ -1,0 +1,21 @@
+# 敏感配置与运行数据，绝不提交
+config.ini
+auto_login.log
+*.log
+
+# 浏览器驱动体积大且随版本变化，见 README 的下载说明
+msedgedriver.exe
+chromedriver.exe
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 本地杂项（截图调试产物、旧文档等）
+*.png
+*.pdf
+readme.txt
+
+# WorkBuddy 项目数据
+.workbuddy/
